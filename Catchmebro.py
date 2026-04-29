@@ -4,12 +4,58 @@ import time
 from datetime import datetime
 import os
 import ctypes
+import sys
 import winreg
 import tkinter as tk
 from tkinter import scrolledtext
 import threading
 from PIL import Image, ImageTk, ImageDraw, ImageFont
 from screeninfo import get_monitors
+
+def is_admin():
+    try:
+        return ctypes.windll.shell32.IsUserAnAdmin()
+    except:
+        return False
+
+if not is_admin():
+    # Scriptin yönetici haklarıyla yeniden başlatılması (Registry değiştirmek için şarttır)
+    script_path = os.path.abspath(sys.argv[0])
+    params = f'"{script_path}"'
+    for arg in sys.argv[1:]:
+        params += f' "{arg}"'
+    ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, params, None, 1)
+    sys.exit()
+
+def set_antigravity_mode(active=True):
+    """USB depolamayı ve yeni cihaz kurulumunu engeller/açar (AntiGravity Protokolü)"""
+    try:
+        if active:
+            # 1. USB Depolamayı Kapat (Değeri 4 yap)
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Services\USBSTOR", 0, winreg.KEY_SET_VALUE) as key:
+                winreg.SetValueEx(key, "Start", 0, winreg.REG_DWORD, 4)
+            
+            # 2. Yeni Cihaz (BadUSB/Klavye vb.) Kurulumunu Engelle
+            try:
+                key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Policies\Microsoft\Windows\DeviceInstall\Restrictions", 0, winreg.KEY_SET_VALUE)
+            except FileNotFoundError:
+                key = winreg.CreateKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Policies\Microsoft\Windows\DeviceInstall\Restrictions")
+            winreg.SetValueEx(key, "DenyUnspecified", 0, winreg.REG_DWORD, 1)
+            winreg.CloseKey(key)
+        else:
+            # 1. USB Depolamayı Aç (Değeri 3 yap)
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Services\USBSTOR", 0, winreg.KEY_SET_VALUE) as key:
+                winreg.SetValueEx(key, "Start", 0, winreg.REG_DWORD, 3)
+                
+            # 2. Yeni Cihaz Kurulumu Engelini Kaldır
+            try:
+                key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Policies\Microsoft\Windows\DeviceInstall\Restrictions", 0, winreg.KEY_SET_VALUE)
+            except FileNotFoundError:
+                key = winreg.CreateKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Policies\Microsoft\Windows\DeviceInstall\Restrictions")
+            winreg.SetValueEx(key, "DenyUnspecified", 0, winreg.REG_DWORD, 0)
+            winreg.CloseKey(key)
+    except Exception as e:
+        print(f"[HATA] AntiGravity modu değiştirilirken hata: {e}")
 
 try:
     import pystray
@@ -171,10 +217,9 @@ class HoneypotApp:
         # HAYALET MOD: Arayüz oluşturulur ancak ekranda ASLA gösterilmez. Arka planda pusuya yatar.
         self.root.withdraw()
 
-        # GLOBAL KISAYOL: Herhangi bir zamanda 'Ctrl + Q' tuşlarına basılırsa sistemi başlatır.
-        self.hotkey_listener = keyboard.GlobalHotKeys({
-            '<ctrl>+q': self.on_hotkey_activate
-        })
+        # GLOBAL KISAYOL (Sadece Ctrl + Q, Alt basılıyken çalışmasını engellemek için özel Listener)
+        self.current_keys = set()
+        self.hotkey_listener = keyboard.Listener(on_press=self.on_bg_press, on_release=self.on_bg_release)
         self.hotkey_listener.start()
         
         # İlk log mesajları
@@ -266,6 +311,31 @@ class HoneypotApp:
         self.log_area.see(tk.END)
         self.log_area.config(state='disabled')
 
+    def on_bg_press(self, key):
+        self.current_keys.add(key)
+        
+        has_ctrl = keyboard.Key.ctrl_l in self.current_keys or keyboard.Key.ctrl_r in self.current_keys
+        has_alt = keyboard.Key.alt_l in self.current_keys or keyboard.Key.alt_r in self.current_keys or keyboard.Key.alt_gr in self.current_keys
+        
+        has_q = False
+        for k in self.current_keys:
+            if hasattr(k, 'char') and k.char:
+                if k.char.lower() == 'q' or k.char == '\x11':
+                    has_q = True
+            elif hasattr(k, 'vk') and k.vk == 81:
+                has_q = True
+
+        # SADECE Ctrl ve Q basılıysa, Alt basılı DEĞİLSE tetikle (Alt+Q veya AltGr+Q engeli)
+        if has_ctrl and has_q and not has_alt:
+            self.on_hotkey_activate()
+            self.current_keys.clear()
+
+    def on_bg_release(self, key):
+        try:
+            self.current_keys.remove(key)
+        except KeyError:
+            pass
+
     def on_hotkey_activate(self):
         # Ctrl+Q basıldığında start_system'i UI thread üzerinden tetikler
         self.root.after(0, self.start_system)
@@ -348,9 +418,13 @@ class HoneypotApp:
             self.update_tray_icon()
             
         self.log_message("[*] SİSTEM AKTİF. İzinsiz girişlere karşı dinleniyor...")
+        
+        # AntiGravity modunu etkinleştir
+        set_antigravity_mode(active=True)
+        self.log_message("[*] AntiGravity Protokolü: Tüm USB'ler ve Depolama engellendi.")
 
-        # Fare ve klavye dinleyicilerini başlat
-        self.mouse_listener = mouse.Listener(on_move=self.on_move, on_click=self.on_click, on_scroll=self.on_scroll)
+        # Fare dinleyicisini başlat (suppress=True ile farenin imlecini kilitler/dondurur)
+        self.mouse_listener = mouse.Listener(on_move=self.on_move, on_click=self.on_click, on_scroll=self.on_scroll, suppress=True)
         self.keyboard_listener = keyboard.Listener(on_press=self.on_press)
         
         self.mouse_listener.start()
@@ -371,6 +445,10 @@ class HoneypotApp:
             self.update_tray_icon()
 
         self.log_message("[*] Sistem deaktif ediliyor...")
+        
+        # AntiGravity modunu kapat
+        set_antigravity_mode(active=False)
+        self.log_message("[*] AntiGravity Protokolü: NORMALE DÖNÜLDÜ. USB erişimi açıldı.")
 
         # Acılan yakalama penceresini kapat
         self.viewer.hide()
